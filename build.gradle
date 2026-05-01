@@ -1,0 +1,168 @@
+plugins {
+    id 'java'
+    id 'scala'
+    id 'io.gatling.gradle' version '3.9.5.6'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation 'com.intuit.karate:karate-core:1.4.1'
+    testImplementation 'com.intuit.karate:karate-junit5:1.4.1'
+    testImplementation 'com.intuit.karate:karate-gatling:1.4.1'
+    testImplementation 'org.apache.kafka:kafka-clients:3.6.1'
+    testImplementation 'org.postgresql:postgresql:42.7.1'
+    testImplementation 'net.masterthought:cucumber-reporting:5.7.7'
+}
+
+sourceSets {
+    test {
+        java {
+            srcDir 'src/test/java'
+        }
+        resources {
+            srcDir 'src/test/resources'
+        }
+        scala {
+            srcDir 'src/test/scala'
+        }
+    }
+}
+
+processTestResources {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+test {
+    useJUnitPlatform()
+    systemProperty 'karate.env', System.getProperty('karate.env', 'BLD')
+}
+
+task apiTest(type: Test) {
+    useJUnitPlatform()
+    include '**/ApiRunner.class'
+    systemProperty 'karate.env', System.getProperty('karate.env', 'BLD')
+}
+
+task uiTest(type: Test) {
+    useJUnitPlatform()
+    include '**/UiRunner.class'
+    systemProperty 'karate.env', System.getProperty('karate.env', 'BLD')
+}
+
+task kafkaTest(type: Test) {
+    useJUnitPlatform()
+    include '**/KafkaRunner.class'
+    systemProperty 'karate.env', System.getProperty('karate.env', 'BLD')
+}
+
+task dbTest(type: Test) {
+    useJUnitPlatform()
+    include '**/DbRunner.class'
+    systemProperty 'karate.env', System.getProperty('karate.env', 'BLD')
+}
+
+task mobileTest(type: Test) {
+    useJUnitPlatform()
+    include '**/MobileRunner.class'
+    systemProperty 'karate.env', System.getProperty('karate.env', 'BLD')
+}
+
+task perfTest {
+    dependsOn 'gatlingRun'
+    doFirst {
+        System.setProperty('karate.env', System.getProperty('karate.env', 'BLD'))
+    }
+}
+
+task generateCucumberReport {
+    description = 'Generates Cucumber HTML and JSON reports from Karate test output'
+    group = 'reporting'
+
+    doLast {
+        def karateReportsDir = file("${buildDir}/karate-reports")
+        def jsonFiles = []
+
+        if (karateReportsDir.exists()) {
+            karateReportsDir.eachFileMatch(~/.+\.json/) { file ->
+                jsonFiles.add(file.absolutePath)
+            }
+        }
+
+        if (jsonFiles.isEmpty()) {
+            logger.warn('No Karate JSON report files found in {}. Skipping Cucumber report generation.', karateReportsDir)
+            return
+        }
+
+        logger.lifecycle('Found {} Karate JSON report file(s). Generating Cucumber reports...', jsonFiles.size())
+
+        def htmlOutputDir = file("${projectDir}/target/cucumber-html-reports")
+        def jsonOutputDir = file("${projectDir}/target/cucumber-reports")
+        htmlOutputDir.mkdirs()
+        jsonOutputDir.mkdirs()
+
+        // Load ReportBuilder from the test classpath
+        def classLoader = new URLClassLoader(
+            configurations.testRuntimeClasspath.collect { it.toURI().toURL() } as URL[],
+            getClass().classLoader
+        )
+
+        def configClass = classLoader.loadClass('net.masterthought.cucumber.Configuration')
+        def reportBuilderClass = classLoader.loadClass('net.masterthought.cucumber.ReportBuilder')
+
+        // Create Configuration(File outputDirectory, String projectName)
+        def config = configClass.getConstructor(File, String).newInstance(htmlOutputDir, 'karate-test-framework')
+
+        // Create ReportBuilder(List<String> jsonFiles, Configuration configuration)
+        def reportBuilder = reportBuilderClass.getConstructor(List, configClass).newInstance(jsonFiles, config)
+
+        // Generate reports
+        def reportable = reportBuilder.generateReports()
+
+        // Copy the merged JSON to target/cucumber-reports/cucumber.json
+        // The cucumber-reporting library generates individual JSON in the output dir;
+        // we consolidate the original Karate JSON files into a single Cucumber JSON report
+        def cucumberJsonFile = new File(jsonOutputDir, 'cucumber.json')
+
+        // Read all source JSON files and merge into a single JSON array
+        def allFeatures = new StringBuilder()
+        allFeatures.append('[')
+        def first = true
+        jsonFiles.each { jsonFilePath ->
+            def content = new File(jsonFilePath).text.trim()
+            // Karate JSON files are arrays of feature objects
+            if (content.startsWith('[') && content.endsWith(']')) {
+                // Strip outer brackets and append contents
+                def inner = content.substring(1, content.length() - 1).trim()
+                if (!inner.isEmpty()) {
+                    if (!first) {
+                        allFeatures.append(',')
+                    }
+                    allFeatures.append(inner)
+                    first = false
+                }
+            } else if (content.startsWith('{')) {
+                // Single feature object
+                if (!first) {
+                    allFeatures.append(',')
+                }
+                allFeatures.append(content)
+                first = false
+            }
+        }
+        allFeatures.append(']')
+        cucumberJsonFile.text = allFeatures.toString()
+
+        logger.lifecycle('Cucumber HTML reports generated at: {}', htmlOutputDir)
+        logger.lifecycle('Cucumber JSON report generated at: {}', cucumberJsonFile)
+    }
+}
+
+// Wire generateCucumberReport to run after test tasks
+['test', 'apiTest', 'uiTest', 'kafkaTest', 'dbTest', 'mobileTest'].each { taskName ->
+    tasks.named(taskName).configure {
+        finalizedBy generateCucumberReport
+    }
+}
